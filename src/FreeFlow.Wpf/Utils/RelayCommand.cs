@@ -29,6 +29,9 @@ public sealed class RelayCommand : ICommand
             return;
         }
 
+        if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            return;
+
         dispatcher.BeginInvoke(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
     }
 }
