@@ -3,7 +3,6 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows;
-using FluentFTP;
 using FreeFlow.Core.Models;
 using FreeFlow.Core.Services;
 using FreeFlow.Wpf.Utils;
@@ -221,53 +220,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             StatusText = $"Testing {dest.Name}…";
             AddActivity($"Testing destination: {dest.Name}");
 
-            using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);
-            if (dest.Protocol == FtpProtocol.Ftps)
+            var result = await FtpConnectionTester.TestAsync(dest, message => RunOnUiThread(() => StatusText = message));
+            if (result.Success)
             {
-                client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
-                client.Config.DataConnectionEncryption = true;
-            }
-
-            // Keep the connection test snappy for MVP.
-            client.Config.ConnectTimeout = 5000;
-            client.Config.ReadTimeout = 10000;
-            client.Config.DataConnectionConnectTimeout = 5000;
-            client.Config.DataConnectionReadTimeout = 10000;
-
-            StatusText = "Connecting…";
-            await client.Connect();
-
-            var remoteDir = FtpPath.NormalizeDirectory(dest.RemotePath);
-            StatusText = "Checking remote folder…";
-            if (!await client.DirectoryExists(remoteDir))
-            {
-                var msg = $"Remote folder does not exist: {remoteDir}";
-                AddActivity($"ERROR: {msg}");
-                MessageBox.Show(msg, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                AddActivity($"Test OK: {dest.Name}");
+                MessageBox.Show(result.Message, "Test destination", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            // Upload a small temp file, then delete it.
-            var testFileName = $".freeflow-test-{Guid.NewGuid():N}.txt";
-            var remoteFile = FtpPath.Combine(remoteDir, testFileName);
-            var localTemp = Path.Combine(Path.GetTempPath(), testFileName);
-
-            await File.WriteAllTextAsync(localTemp, $"FreeFlow test upload at {DateTime.Now:O}");
-            try
-            {
-                StatusText = "Uploading test file…";
-                await client.UploadFile(localTemp, remoteFile, FtpRemoteExists.Overwrite, createRemoteDir: true);
-
-                StatusText = "Cleaning up…";
-                await client.DeleteFile(remoteFile);
-            }
-            finally
-            {
-                try { File.Delete(localTemp); } catch { /* best-effort */ }
-            }
-
-            AddActivity($"Test OK: {dest.Name}");
-            MessageBox.Show("Success! Connection and upload test passed.", "Test destination", MessageBoxButton.OK, MessageBoxImage.Information);
+            AddActivity($"ERROR: Test failed for {dest.Name}: {result.Message}");
+            MessageBox.Show(result.Message, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         catch (Exception ex)
         {
