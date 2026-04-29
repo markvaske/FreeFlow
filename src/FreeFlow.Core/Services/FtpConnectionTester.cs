@@ -64,7 +64,7 @@ public static class FtpConnectionTester
 
             statusChanged?.Invoke("Uploading test file...");
             cancellationToken.ThrowIfCancellationRequested();
-            await client.UploadFile(localTemp, remoteFile, FtpRemoteExists.Overwrite, createRemoteDir: true);
+            await client.UploadFile(localTemp, remoteFile, FtpRemoteExists.Overwrite, createRemoteDir: false);
 
             statusChanged?.Invoke("Cleaning up...");
             cancellationToken.ThrowIfCancellationRequested();

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using FreeFlow.Core.Models;
 using FreeFlow.Core.Services;
+using Serilog;
 
 namespace FreeFlow.Wpf.Services;
 
@@ -58,7 +59,10 @@ internal sealed class WindowsSettingsService
         }
         catch (Exception ex) when (ex is CryptographicException or FormatException)
         {
-            return string.Empty;
+            // Return the original protected value to avoid silently wiping the password
+            // when DPAPI fails (e.g., settings copied to a different user/machine).
+            Log.Warning(ex, "Failed to unprotect password; returning original protected value");
+            return password;
         }
     }
 
