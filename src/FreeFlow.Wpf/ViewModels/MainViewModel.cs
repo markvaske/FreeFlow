@@ -1,7 +1,9 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows;
+using FluentFTP;
 using FreeFlow.Core.Models;
 using FreeFlow.Core.Services;
 using FreeFlow.Wpf.Utils;
@@ -16,6 +18,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private FileWatcherService? _watcher;
     private bool _isRunning;
     private string _statusText = "Stopped";
+    private bool _isTesting;
 
     public MainViewModel()
     {
@@ -29,7 +32,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AddDestinationCommand = new RelayCommand(AddDestination);
         EditDestinationCommand = new RelayCommand(EditSelectedDestination, () => SelectedDestination is not null);
         RemoveDestinationCommand = new RelayCommand(RemoveSelectedDestination, () => SelectedDestination is not null);
-        TestDestinationCommand = new RelayCommand(TestSelectedDestination, () => SelectedDestination is not null);
+        TestDestinationCommand = new AsyncRelayCommand(TestSelectedDestinationAsync, () => SelectedDestination is not null && !IsRunning && !IsTesting);
 
         StartCommand = new RelayCommand(Start, () => !IsRunning);
         StopCommand = new RelayCommand(Stop, () => IsRunning);
@@ -47,7 +50,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public RelayCommand AddDestinationCommand { get; }
     public RelayCommand EditDestinationCommand { get; }
     public RelayCommand RemoveDestinationCommand { get; }
-    public RelayCommand TestDestinationCommand { get; }
+    public AsyncRelayCommand TestDestinationCommand { get; }
     public RelayCommand StartCommand { get; }
     public RelayCommand StopCommand { get; }
     public RelayCommand SaveCommand { get; }
@@ -94,6 +97,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (_statusText == value) return;
             _statusText = value;
             OnPropertyChanged();
+        }
+    }
+
+    public bool IsTesting
+    {
+        get => _isTesting;
+        private set
+        {
+            if (_isTesting == value) return;
+            _isTesting = value;
+            OnPropertyChanged();
+            RefreshCanExecute();
         }
     }
 
@@ -168,7 +183,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AddActivity($"Removed destination: {name}");
     }
 
-    private void TestSelectedDestination()
+    private async Task TestSelectedDestinationAsync()
     {
         if (SelectedDestination is null) return;
 
@@ -183,8 +198,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        // MVP: lightweight “test” that just validates we have enough info.
-        // A real connection test will be added once UI + protocol plumbing is solid.
         if (string.IsNullOrWhiteSpace(SelectedDestination.Host) ||
             string.IsNullOrWhiteSpace(SelectedDestination.Username) ||
             string.IsNullOrWhiteSpace(SelectedDestination.Password))
@@ -198,12 +211,73 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        MessageBox.Show(
-            "Looks good (basic validation passed).\n\nNext step: implement a real connect/upload test.",
-            "Test destination",
-            MessageBoxButton.OK,
-            MessageBoxImage.Information
-        );
+        IsTesting = true;
+        var dest = Clone(SelectedDestination);
+        var originalStatus = StatusText;
+
+        try
+        {
+            StatusText = $"Testing {dest.Name}…";
+            AddActivity($"Testing destination: {dest.Name}");
+
+            using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);
+            if (dest.Protocol == FtpProtocol.Ftps)
+            {
+                client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
+                client.Config.DataConnectionEncryption = true;
+            }
+
+            // Keep the connection test snappy for MVP.
+            client.Config.ConnectTimeout = 5000;
+            client.Config.ReadTimeout = 10000;
+            client.Config.DataConnectionConnectTimeout = 5000;
+            client.Config.DataConnectionReadTimeout = 10000;
+
+            StatusText = "Connecting…";
+            await client.Connect();
+
+            var remoteDir = NormalizeRemoteDir(dest.RemotePath);
+            StatusText = "Checking remote folder…";
+            if (!await client.DirectoryExists(remoteDir))
+            {
+                var msg = $"Remote folder does not exist: {remoteDir}";
+                AddActivity($"ERROR: {msg}");
+                MessageBox.Show(msg, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            // Upload a small temp file, then delete it.
+            var testFileName = $".freeflow-test-{Guid.NewGuid():N}.txt";
+            var remoteFile = CombineRemotePath(remoteDir, testFileName);
+            var localTemp = Path.Combine(Path.GetTempPath(), testFileName);
+
+            await File.WriteAllTextAsync(localTemp, $"FreeFlow test upload at {DateTime.Now:O}");
+            try
+            {
+                StatusText = "Uploading test file…";
+                await client.UploadFile(localTemp, remoteFile, FtpRemoteExists.Overwrite, createRemoteDir: true);
+
+                StatusText = "Cleaning up…";
+                await client.DeleteFile(remoteFile);
+            }
+            finally
+            {
+                try { File.Delete(localTemp); } catch { /* best-effort */ }
+            }
+
+            AddActivity($"Test OK: {dest.Name}");
+            MessageBox.Show("Success! Connection and upload test passed.", "Test destination", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            AddActivity($"ERROR: Test failed for {dest.Name}: {ex.Message}");
+            MessageBox.Show(ex.Message, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            StatusText = originalStatus;
+            IsTesting = false;
+        }
     }
 
     private void Start()
@@ -333,6 +407,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
         target.RemotePath = src.RemotePath;
         target.Protocol = src.Protocol;
         target.IsEnabled = src.IsEnabled;
+    }
+
+    private static string NormalizeRemoteDir(string? remotePath)
+    {
+        var p = (remotePath ?? string.Empty).Trim();
+        if (string.IsNullOrEmpty(p)) return "/";
+        p = p.Replace('\\', '/');
+        if (!p.StartsWith("/")) p = "/" + p;
+        if (p.Length > 1 && p.EndsWith("/")) p = p.TrimEnd('/');
+        return p;
+    }
+
+    private static string CombineRemotePath(string remoteDir, string fileName)
+    {
+        var dir = NormalizeRemoteDir(remoteDir);
+        return dir == "/" ? $"/{fileName}" : $"{dir}/{fileName}";
     }
 }
 
