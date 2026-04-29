@@ -6,7 +6,8 @@
         mc:Ignorable="d"
         Title="FreeFlow - Stats File Uploader" 
         Height="620" Width="980"
-        WindowStartupLocation="CenterScreen">
+        WindowStartupLocation="CenterScreen"
+        Closing="OnClosing">
     <Grid Margin="16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -116,6 +117,6 @@
                    TextWrapping="Wrap"
                    Foreground="#666"
                    Margin="0,12,0,0"
-                   Text="MVP note: SFTP and password encryption are not implemented yet. Use FTP/FTPS for now."/>
+                   Text="MVP note: FTP/FTPS are supported; SFTP is not implemented yet. Saved passwords are protected for the current Windows user."/>
     </Grid>
 </Window>

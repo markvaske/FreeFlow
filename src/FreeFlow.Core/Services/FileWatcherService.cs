@@ -5,29 +5,28 @@ using Serilog;
 
 namespace FreeFlow.Core.Services;
 
-public class FileWatcherService
+public class FileWatcherService : IDisposable
 {
     private readonly AppSettings _settings;
     private FileSystemWatcher? _watcher;
-    private readonly SettingsService _settingsService;
     private bool _isRunning;
     private readonly object _changeLock = new();
     private CancellationTokenSource? _changeCts;
+    private bool _disposed;
 
     public event Action<UploadResult>? UploadCompleted;
     public event Action<string>? ErrorOccurred;
     public event Action<string>? StatusChanged;
 
-    public FileWatcherService(AppSettings settings, SettingsService settingsService)
+    public FileWatcherService(AppSettings settings)
     {
         _settings = settings;
-        _settingsService = settingsService;
     }
 
-    public void Start()
+    public bool Start()
     {
         if (_isRunning || string.IsNullOrEmpty(_settings.WatchedFilePath))
-            return;
+            return false;
 
         _watcher = new FileSystemWatcher
         {
@@ -42,12 +41,16 @@ public class FileWatcherService
 
         StatusChanged?.Invoke("Watching for file changes...");
         Log.Information("File watcher started for {File}", _settings.WatchedFilePath);
+        return true;
     }
 
     public void Stop()
     {
+        bool wasRunning;
         lock (_changeLock)
         {
+            wasRunning = _isRunning;
+            _isRunning = false;
             _changeCts?.Cancel();
             _changeCts?.Dispose();
             _changeCts = null;
@@ -55,8 +58,8 @@ public class FileWatcherService
 
         _watcher?.Dispose();
         _watcher = null;
-        _isRunning = false;
-        StatusChanged?.Invoke("Stopped");
+        if (wasRunning)
+            StatusChanged?.Invoke("Stopped");
     }
 
     private async void OnFileChanged(object sender, FileSystemEventArgs e)
@@ -64,6 +67,8 @@ public class FileWatcherService
         CancellationToken token;
         lock (_changeLock)
         {
+            if (!_isRunning)
+                return;
             _changeCts?.Cancel();
             _changeCts?.Dispose();
             _changeCts = new CancellationTokenSource();
@@ -74,8 +79,6 @@ public class FileWatcherService
         {
             StatusChanged?.Invoke("File changed — waiting for stability...");
 
-            // Debounce bursts of change events, then require the file to be stable
-            // (size + last-write unchanged) before uploading.
             await Task.Delay(TimeSpan.FromSeconds(_settings.SettleDelaySeconds), token);
 
             var ready = await WaitForFileToBeReady(
@@ -129,7 +132,6 @@ public class FileWatcherService
                     continue;
                 }
 
-                // If another process is still writing, this will typically throw.
                 using var _ = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.None);
             }
             catch
@@ -142,7 +144,6 @@ public class FileWatcherService
                 prev.Length == current.Length &&
                 prev.LastWriteTimeUtc == current.LastWriteTimeUtc)
             {
-                // Confirm stability holds for at least the stable window.
                 await Task.Delay(stableWindow, token);
 
                 var confirm = new FileInfo(filePath);
@@ -176,16 +177,28 @@ public class FileWatcherService
 
     private async Task UploadToDestination(string filePath, FtpDestination dest, FileInfo fileInfo)
     {
+        if (dest.Protocol == FtpProtocol.Sftp)
+        {
+            var sftp = new UploadResult
+            {
+                FileName = fileInfo.Name,
+                Success = false,
+                ErrorMessage = "SFTP is not yet supported.",
+                DestinationName = dest.Name
+            };
+            UploadCompleted?.Invoke(sftp);
+            ErrorOccurred?.Invoke($"Skipped upload to {dest.Name}: SFTP is not yet supported.");
+            return;
+        }
+
         try
         {
             using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);
-
-            if (dest.Protocol == FtpProtocol.Ftps)
-                client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
+            FtpClientOptions.Configure(client, dest.Protocol);
 
             await client.Connect();
 
-            var remoteFile = Path.Combine(dest.RemotePath, fileInfo.Name);
+            var remoteFile = FtpPath.Combine(dest.RemotePath, fileInfo.Name);
             await client.UploadFile(filePath, remoteFile, FtpRemoteExists.Overwrite, true);
 
             var result = new UploadResult
@@ -211,5 +224,14 @@ public class FileWatcherService
             UploadCompleted?.Invoke(result);
             ErrorOccurred?.Invoke($"Failed to upload to {dest.Name}: {ex.Message}");
         }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        Stop();
+        _disposed = true;
     }
 }

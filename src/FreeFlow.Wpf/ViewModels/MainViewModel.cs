@@ -1,25 +1,29 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using FreeFlow.Core.Models;
 using FreeFlow.Core.Services;
+using FreeFlow.Wpf.Services;
 using FreeFlow.Wpf.Utils;
 using Microsoft.Win32;
 
 namespace FreeFlow.Wpf.ViewModels;
 
-public sealed class MainViewModel : INotifyPropertyChanged
+public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
-    private readonly SettingsService _settingsService;
+    private readonly WindowsSettingsService _settingsService;
     private AppSettings _settings;
     private FileWatcherService? _watcher;
     private bool _isRunning;
     private string _statusText = "Stopped";
+    private bool _isTesting;
+    private bool _disposed;
 
     public MainViewModel()
     {
-        _settingsService = new SettingsService();
+        _settingsService = new WindowsSettingsService();
         _settings = _settingsService.Load();
 
         Destinations = new ObservableCollection<FtpDestination>(_settings.Destinations);
@@ -29,7 +33,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AddDestinationCommand = new RelayCommand(AddDestination);
         EditDestinationCommand = new RelayCommand(EditSelectedDestination, () => SelectedDestination is not null);
         RemoveDestinationCommand = new RelayCommand(RemoveSelectedDestination, () => SelectedDestination is not null);
-        TestDestinationCommand = new RelayCommand(TestSelectedDestination, () => SelectedDestination is not null);
+        TestDestinationCommand = new AsyncRelayCommand(TestSelectedDestinationAsync, () => SelectedDestination is not null && !IsRunning && !IsTesting);
 
         StartCommand = new RelayCommand(Start, () => !IsRunning);
         StopCommand = new RelayCommand(Stop, () => IsRunning);
@@ -47,7 +51,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public RelayCommand AddDestinationCommand { get; }
     public RelayCommand EditDestinationCommand { get; }
     public RelayCommand RemoveDestinationCommand { get; }
-    public RelayCommand TestDestinationCommand { get; }
+    public AsyncRelayCommand TestDestinationCommand { get; }
     public RelayCommand StartCommand { get; }
     public RelayCommand StopCommand { get; }
     public RelayCommand SaveCommand { get; }
@@ -94,6 +98,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (_statusText == value) return;
             _statusText = value;
             OnPropertyChanged();
+        }
+    }
+
+    public bool IsTesting
+    {
+        get => _isTesting;
+        private set
+        {
+            if (_isTesting == value) return;
+            _isTesting = value;
+            OnPropertyChanged();
+            RefreshCanExecute();
         }
     }
 
@@ -168,7 +184,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         AddActivity($"Removed destination: {name}");
     }
 
-    private void TestSelectedDestination()
+    private async Task TestSelectedDestinationAsync()
     {
         if (SelectedDestination is null) return;
 
@@ -183,8 +199,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        // MVP: lightweight “test” that just validates we have enough info.
-        // A real connection test will be added once UI + protocol plumbing is solid.
         if (string.IsNullOrWhiteSpace(SelectedDestination.Host) ||
             string.IsNullOrWhiteSpace(SelectedDestination.Username) ||
             string.IsNullOrWhiteSpace(SelectedDestination.Password))
@@ -198,19 +212,51 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
-        MessageBox.Show(
-            "Looks good (basic validation passed).\n\nNext step: implement a real connect/upload test.",
-            "Test destination",
-            MessageBoxButton.OK,
-            MessageBoxImage.Information
-        );
+        IsTesting = true;
+        var dest = Clone(SelectedDestination);
+        var originalStatus = StatusText;
+
+        try
+        {
+            StatusText = $"Testing {dest.Name}…";
+            AddActivity($"Testing destination: {dest.Name}");
+
+            var result = await FtpConnectionTester.TestAsync(dest, message => RunOnUiThread(() => StatusText = message));
+            if (result.Success)
+            {
+                AddActivity($"Test OK: {dest.Name}");
+                MessageBox.Show(result.Message, "Test destination", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            AddActivity($"ERROR: Test failed for {dest.Name}: {result.Message}");
+            MessageBox.Show(result.Message, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        catch (Exception ex)
+        {
+            AddActivity($"ERROR: Test failed for {dest.Name}: {ex.Message}");
+            MessageBox.Show(ex.Message, "Test failed", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            StatusText = originalStatus;
+            IsTesting = false;
+        }
     }
 
     private void Start()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (string.IsNullOrWhiteSpace(WatchedFilePath))
         {
             MessageBox.Show("Choose a watched file first.", "Missing watched file", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!File.Exists(WatchedFilePath))
+        {
+            MessageBox.Show("The watched file no longer exists. Choose the current stats file before starting.", "Watched file not found", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -235,12 +281,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _settings.Destinations = Destinations.ToList();
         Save();
 
-        _watcher = new FileWatcherService(_settings, _settingsService);
+        DisposeWatcher();
+        _watcher = new FileWatcherService(_settings);
         _watcher.StatusChanged += StatusChanged;
         _watcher.ErrorOccurred += ErrorOccurred;
         _watcher.UploadCompleted += UploadCompleted;
 
-        _watcher.Start();
+        if (!_watcher.Start())
+        {
+            DisposeWatcher();
+            return;
+        }
+
         IsRunning = true;
         StatusText = "Watching...";
         AddActivity("Started watching.");
@@ -248,8 +300,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void Stop()
     {
-        _watcher?.Stop();
-        _watcher = null;
+        DisposeWatcher();
         IsRunning = false;
         StatusText = "Stopped";
         AddActivity("Stopped.");
@@ -264,7 +315,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void StatusChanged(string message)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             StatusText = message;
             AddActivity(message);
@@ -273,7 +324,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void ErrorOccurred(string message)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             StatusText = "Error";
             AddActivity($"ERROR: {message}");
@@ -282,7 +333,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void UploadCompleted(UploadResult result)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             var outcome = result.Success ? "OK" : $"FAIL ({result.ErrorMessage})";
             AddActivity($"Upload {outcome}: {result.FileName} → {result.DestinationName}");
@@ -334,5 +385,40 @@ public sealed class MainViewModel : INotifyPropertyChanged
         target.Protocol = src.Protocol;
         target.IsEnabled = src.IsEnabled;
     }
-}
 
+    private void DisposeWatcher()
+    {
+        if (_watcher is null)
+            return;
+
+        _watcher.StatusChanged -= StatusChanged;
+        _watcher.ErrorOccurred -= ErrorOccurred;
+        _watcher.UploadCompleted -= UploadCompleted;
+        _watcher.Dispose();
+        _watcher = null;
+    }
+
+    private static void RunOnUiThread(Action action)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+            return;
+
+        if (dispatcher.CheckAccess())
+        {
+            action();
+            return;
+        }
+
+        dispatcher.BeginInvoke(action);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        DisposeWatcher();
+        _disposed = true;
+    }
+}
