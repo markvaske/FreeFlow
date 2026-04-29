@@ -198,7 +198,7 @@ public class FileWatcherService : IDisposable
 
             await client.Connect();
 
-            var remoteFile = FtpPath.Combine(FtpPath.NormalizeDirectory(dest.RemotePath), fileInfo.Name);
+            var remoteFile = FtpPath.Combine(dest.RemotePath, fileInfo.Name);
             await client.UploadFile(filePath, remoteFile, FtpRemoteExists.Overwrite, true);
 
             var result = new UploadResult
