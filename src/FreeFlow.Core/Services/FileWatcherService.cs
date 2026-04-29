@@ -46,8 +46,11 @@ public class FileWatcherService : IDisposable
 
     public void Stop()
     {
+        bool wasRunning;
         lock (_changeLock)
         {
+            wasRunning = _isRunning;
+            _isRunning = false;
             _changeCts?.Cancel();
             _changeCts?.Dispose();
             _changeCts = null;
@@ -55,8 +58,8 @@ public class FileWatcherService : IDisposable
 
         _watcher?.Dispose();
         _watcher = null;
-        _isRunning = false;
-        StatusChanged?.Invoke("Stopped");
+        if (wasRunning)
+            StatusChanged?.Invoke("Stopped");
     }
 
     private async void OnFileChanged(object sender, FileSystemEventArgs e)
@@ -64,6 +67,8 @@ public class FileWatcherService : IDisposable
         CancellationToken token;
         lock (_changeLock)
         {
+            if (!_isRunning)
+                return;
             _changeCts?.Cancel();
             _changeCts?.Dispose();
             _changeCts = new CancellationTokenSource();
@@ -172,6 +177,20 @@ public class FileWatcherService : IDisposable
 
     private async Task UploadToDestination(string filePath, FtpDestination dest, FileInfo fileInfo)
     {
+        if (dest.Protocol == FtpProtocol.Sftp)
+        {
+            var sftp = new UploadResult
+            {
+                FileName = fileInfo.Name,
+                Success = false,
+                ErrorMessage = "SFTP is not yet supported.",
+                DestinationName = dest.Name
+            };
+            UploadCompleted?.Invoke(sftp);
+            ErrorOccurred?.Invoke($"Skipped upload to {dest.Name}: SFTP is not yet supported.");
+            return;
+        }
+
         try
         {
             using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);

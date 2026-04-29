@@ -34,6 +34,11 @@ public sealed class AsyncRelayCommand : ICommand
             RaiseCanExecuteChanged();
             await _executeAsync().ConfigureAwait(true);
         }
+        catch (Exception ex)
+        {
+            // Prevent unhandled exceptions from crashing the UI thread via async void.
+            System.Diagnostics.Debug.WriteLine($"[AsyncRelayCommand] Execution failed: {ex}");
+        }
         finally
         {
             Interlocked.Exchange(ref _isExecuting, 0);
@@ -49,6 +54,9 @@ public sealed class AsyncRelayCommand : ICommand
             CanExecuteChanged?.Invoke(this, EventArgs.Empty);
             return;
         }
+
+        if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            return;
 
         dispatcher.BeginInvoke(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
     }
