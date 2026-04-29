@@ -7,7 +7,7 @@ Built for college athletic departments who are tired of manual uploads and vendo
 ## Features (MVP)
 - Watch a single stats file (XML, JSON, etc.)
 - Auto-upload on change with smart "settle" logic
-- Support for FTP, FTPS, and SFTP
+- Support for FTP and FTPS
 - Multiple destinations
 - Clean WPF UI (Windows 10+)
 - System tray support (coming soon)
@@ -36,8 +36,11 @@ The `FreeFlow.Core` library can be fully developed and tested on macOS.
 
 ## Roadmap
 - v0.1: Core file watcher + multi-destination upload (current)
-- v0.2: WPF settings UI + system tray
+- v0.2: WPF settings UI + system tray + SFTP
 - v0.3: Installer + auto-start
+
+## MVP Security Note
+Passwords are currently saved in the local `settings.json` file as plain text. This keeps the MVP simple, but the Windows UI should move to DPAPI (`ProtectedData`) before broad production use.
 
 ## Contributing
 Pull requests welcome! Please open an issue first for major changes.

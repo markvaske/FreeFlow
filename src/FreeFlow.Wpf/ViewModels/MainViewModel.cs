@@ -11,7 +11,7 @@ using Microsoft.Win32;
 
 namespace FreeFlow.Wpf.ViewModels;
 
-public sealed class MainViewModel : INotifyPropertyChanged
+public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
     private readonly SettingsService _settingsService;
     private AppSettings _settings;
@@ -19,6 +19,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private bool _isRunning;
     private string _statusText = "Stopped";
     private bool _isTesting;
+    private bool _disposed;
 
     public MainViewModel()
     {
@@ -236,7 +237,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             StatusText = "Connecting…";
             await client.Connect();
 
-            var remoteDir = NormalizeRemoteDir(dest.RemotePath);
+            var remoteDir = FtpPath.NormalizeDirectory(dest.RemotePath);
             StatusText = "Checking remote folder…";
             if (!await client.DirectoryExists(remoteDir))
             {
@@ -248,7 +249,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
             // Upload a small temp file, then delete it.
             var testFileName = $".freeflow-test-{Guid.NewGuid():N}.txt";
-            var remoteFile = CombineRemotePath(remoteDir, testFileName);
+            var remoteFile = FtpPath.Combine(remoteDir, testFileName);
             var localTemp = Path.Combine(Path.GetTempPath(), testFileName);
 
             await File.WriteAllTextAsync(localTemp, $"FreeFlow test upload at {DateTime.Now:O}");
@@ -282,9 +283,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void Start()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (string.IsNullOrWhiteSpace(WatchedFilePath))
         {
             MessageBox.Show("Choose a watched file first.", "Missing watched file", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!File.Exists(WatchedFilePath))
+        {
+            MessageBox.Show("The watched file no longer exists. Choose the current stats file before starting.", "Watched file not found", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
 
@@ -309,12 +318,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _settings.Destinations = Destinations.ToList();
         Save();
 
-        _watcher = new FileWatcherService(_settings, _settingsService);
+        DisposeWatcher();
+        _watcher = new FileWatcherService(_settings);
         _watcher.StatusChanged += StatusChanged;
         _watcher.ErrorOccurred += ErrorOccurred;
         _watcher.UploadCompleted += UploadCompleted;
 
-        _watcher.Start();
+        if (!_watcher.Start())
+        {
+            DisposeWatcher();
+            return;
+        }
+
         IsRunning = true;
         StatusText = "Watching...";
         AddActivity("Started watching.");
@@ -322,8 +337,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void Stop()
     {
-        _watcher?.Stop();
-        _watcher = null;
+        DisposeWatcher();
         IsRunning = false;
         StatusText = "Stopped";
         AddActivity("Stopped.");
@@ -338,7 +352,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void StatusChanged(string message)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             StatusText = message;
             AddActivity(message);
@@ -347,7 +361,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void ErrorOccurred(string message)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             StatusText = "Error";
             AddActivity($"ERROR: {message}");
@@ -356,7 +370,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void UploadCompleted(UploadResult result)
     {
-        Application.Current.Dispatcher.Invoke(() =>
+        RunOnUiThread(() =>
         {
             var outcome = result.Success ? "OK" : $"FAIL ({result.ErrorMessage})";
             AddActivity($"Upload {outcome}: {result.FileName} → {result.DestinationName}");
@@ -409,20 +423,39 @@ public sealed class MainViewModel : INotifyPropertyChanged
         target.IsEnabled = src.IsEnabled;
     }
 
-    private static string NormalizeRemoteDir(string? remotePath)
+    private void DisposeWatcher()
     {
-        var p = (remotePath ?? string.Empty).Trim();
-        if (string.IsNullOrEmpty(p)) return "/";
-        p = p.Replace('\\', '/');
-        if (!p.StartsWith("/")) p = "/" + p;
-        if (p.Length > 1 && p.EndsWith("/")) p = p.TrimEnd('/');
-        return p;
+        if (_watcher is null)
+            return;
+
+        _watcher.StatusChanged -= StatusChanged;
+        _watcher.ErrorOccurred -= ErrorOccurred;
+        _watcher.UploadCompleted -= UploadCompleted;
+        _watcher.Dispose();
+        _watcher = null;
     }
 
-    private static string CombineRemotePath(string remoteDir, string fileName)
+    private static void RunOnUiThread(Action action)
     {
-        var dir = NormalizeRemoteDir(remoteDir);
-        return dir == "/" ? $"/{fileName}" : $"{dir}/{fileName}";
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+            return;
+
+        if (dispatcher.CheckAccess())
+        {
+            action();
+            return;
+        }
+
+        dispatcher.BeginInvoke(action);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        DisposeWatcher();
+        _disposed = true;
     }
 }
-

@@ -1,3 +1,5 @@
+using System.Threading;
+using System.Windows;
 using System.Windows.Input;
 
 namespace FreeFlow.Wpf.Utils;
@@ -6,7 +8,7 @@ public sealed class AsyncRelayCommand : ICommand
 {
     private readonly Func<Task> _executeAsync;
     private readonly Func<bool>? _canExecute;
-    private bool _isExecuting;
+    private int _isExecuting;
 
     public AsyncRelayCommand(Func<Task> executeAsync, Func<bool>? canExecute = null)
     {
@@ -17,26 +19,37 @@ public sealed class AsyncRelayCommand : ICommand
     public event EventHandler? CanExecuteChanged;
 
     public bool CanExecute(object? parameter) =>
-        !_isExecuting && (_canExecute?.Invoke() ?? true);
+        Volatile.Read(ref _isExecuting) == 0 && (_canExecute?.Invoke() ?? true);
 
     public async void Execute(object? parameter)
     {
         if (!CanExecute(parameter))
             return;
 
+        if (Interlocked.Exchange(ref _isExecuting, 1) == 1)
+            return;
+
         try
         {
-            _isExecuting = true;
             RaiseCanExecuteChanged();
             await _executeAsync().ConfigureAwait(true);
         }
         finally
         {
-            _isExecuting = false;
+            Interlocked.Exchange(ref _isExecuting, 0);
             RaiseCanExecuteChanged();
         }
     }
 
-    public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
-}
+    public void RaiseCanExecuteChanged()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+        {
+            CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
 
+        dispatcher.BeginInvoke(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+    }
+}

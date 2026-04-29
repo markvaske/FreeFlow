@@ -1,3 +1,4 @@
+using System.Windows;
 using System.Windows.Input;
 
 namespace FreeFlow.Wpf.Utils;
@@ -19,6 +20,15 @@ public sealed class RelayCommand : ICommand
 
     public void Execute(object? parameter) => _execute();
 
-    public void RaiseCanExecuteChanged() => CanExecuteChanged?.Invoke(this, EventArgs.Empty);
-}
+    public void RaiseCanExecuteChanged()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+        {
+            CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            return;
+        }
 
+        dispatcher.BeginInvoke(() => CanExecuteChanged?.Invoke(this, EventArgs.Empty));
+    }
+}

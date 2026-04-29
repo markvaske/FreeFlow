@@ -5,58 +5,84 @@ using Serilog;
 
 namespace FreeFlow.Core.Services;
 
-public class FileWatcherService
+public sealed class FileWatcherService : IDisposable
 {
     private readonly AppSettings _settings;
-    private FileSystemWatcher? _watcher;
-    private readonly SettingsService _settingsService;
-    private bool _isRunning;
     private readonly object _changeLock = new();
+    private readonly SemaphoreSlim _uploadLock = new(1, 1);
+    private FileSystemWatcher? _watcher;
     private CancellationTokenSource? _changeCts;
+    private bool _isRunning;
+    private bool _disposed;
 
     public event Action<UploadResult>? UploadCompleted;
     public event Action<string>? ErrorOccurred;
     public event Action<string>? StatusChanged;
 
-    public FileWatcherService(AppSettings settings, SettingsService settingsService)
+    public FileWatcherService(AppSettings settings)
     {
         _settings = settings;
-        _settingsService = settingsService;
     }
 
-    public void Start()
+    public bool Start()
     {
-        if (_isRunning || string.IsNullOrEmpty(_settings.WatchedFilePath))
-            return;
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _watcher = new FileSystemWatcher
+        if (_isRunning || string.IsNullOrEmpty(_settings.WatchedFilePath))
+            return false;
+
+        var directory = Path.GetDirectoryName(_settings.WatchedFilePath);
+        var fileName = Path.GetFileName(_settings.WatchedFilePath);
+        if (string.IsNullOrWhiteSpace(directory) || string.IsNullOrWhiteSpace(fileName))
         {
-            Path = Path.GetDirectoryName(_settings.WatchedFilePath)!,
-            Filter = Path.GetFileName(_settings.WatchedFilePath),
-            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size
-        };
+            ErrorOccurred?.Invoke("The watched file path is invalid.");
+            return false;
+        }
+
+        try
+        {
+            _watcher = new FileSystemWatcher
+            {
+                Path = directory,
+                Filter = fileName,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size
+            };
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
+        {
+            ErrorOccurred?.Invoke($"Unable to watch the file: {ex.Message}");
+            return false;
+        }
 
         _watcher.Changed += OnFileChanged;
+        _watcher.Created += OnFileChanged;
+        _watcher.Renamed += OnFileRenamed;
         _watcher.EnableRaisingEvents = true;
         _isRunning = true;
 
         StatusChanged?.Invoke("Watching for file changes...");
         Log.Information("File watcher started for {File}", _settings.WatchedFilePath);
+        return true;
     }
 
     public void Stop()
     {
-        lock (_changeLock)
+        CancelPendingChange();
+
+        if (_watcher is not null)
         {
-            _changeCts?.Cancel();
-            _changeCts?.Dispose();
-            _changeCts = null;
+            _watcher.EnableRaisingEvents = false;
+            _watcher.Changed -= OnFileChanged;
+            _watcher.Created -= OnFileChanged;
+            _watcher.Renamed -= OnFileRenamed;
+            _watcher.Dispose();
+            _watcher = null;
         }
 
-        _watcher?.Dispose();
-        _watcher = null;
+        var wasRunning = _isRunning;
         _isRunning = false;
-        StatusChanged?.Invoke("Stopped");
+        if (wasRunning)
+            StatusChanged?.Invoke("Stopped");
     }
 
     private async void OnFileChanged(object sender, FileSystemEventArgs e)
@@ -64,6 +90,9 @@ public class FileWatcherService
         CancellationToken token;
         lock (_changeLock)
         {
+            if (!_isRunning || _disposed)
+                return;
+
             _changeCts?.Cancel();
             _changeCts?.Dispose();
             _changeCts = new CancellationTokenSource();
@@ -92,7 +121,16 @@ public class FileWatcherService
             }
 
             StatusChanged?.Invoke("Uploading...");
-            await UploadToAllDestinations(e.FullPath);
+            await _uploadLock.WaitAsync(token);
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                await UploadToAllDestinations(e.FullPath, token);
+            }
+            finally
+            {
+                _uploadLock.Release();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -104,6 +142,8 @@ public class FileWatcherService
             ErrorOccurred?.Invoke(ex.Message);
         }
     }
+
+    private void OnFileRenamed(object sender, RenamedEventArgs e) => OnFileChanged(sender, e);
 
     private static async Task<bool> WaitForFileToBeReady(
         string filePath,
@@ -148,7 +188,8 @@ public class FileWatcherService
                 var confirm = new FileInfo(filePath);
                 if (confirm.Exists &&
                     confirm.Length == current.Length &&
-                    confirm.LastWriteTimeUtc == current.LastWriteTimeUtc)
+                    confirm.LastWriteTimeUtc == current.LastWriteTimeUtc &&
+                    CanOpenExclusive(filePath))
                 {
                     return true;
                 }
@@ -161,20 +202,37 @@ public class FileWatcherService
         return false;
     }
 
-    private async Task UploadToAllDestinations(string filePath)
+    private static bool CanOpenExclusive(string filePath)
+    {
+        try
+        {
+            using var _ = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.None);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task UploadToAllDestinations(string filePath, CancellationToken token)
     {
         var fileInfo = new FileInfo(filePath);
         var tasks = new List<Task>();
 
         foreach (var dest in _settings.Destinations.Where(d => d.IsEnabled))
         {
-            tasks.Add(UploadToDestination(filePath, dest, fileInfo));
+            tasks.Add(UploadToDestination(filePath, dest, fileInfo, token));
         }
 
         await Task.WhenAll(tasks);
     }
 
-    private async Task UploadToDestination(string filePath, FtpDestination dest, FileInfo fileInfo)
+    private async Task UploadToDestination(
+        string filePath,
+        FtpDestination dest,
+        FileInfo fileInfo,
+        CancellationToken token)
     {
         try
         {
@@ -183,9 +241,11 @@ public class FileWatcherService
             if (dest.Protocol == FtpProtocol.Ftps)
                 client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
 
+            token.ThrowIfCancellationRequested();
             await client.Connect();
 
-            var remoteFile = Path.Combine(dest.RemotePath, fileInfo.Name);
+            var remoteFile = FtpPath.Combine(dest.RemotePath, fileInfo.Name);
+            token.ThrowIfCancellationRequested();
             await client.UploadFile(filePath, remoteFile, FtpRemoteExists.Overwrite, true);
 
             var result = new UploadResult
@@ -199,6 +259,10 @@ public class FileWatcherService
             UploadCompleted?.Invoke(result);
             Log.Information("Uploaded to {Destination}", dest.Name);
         }
+        catch (OperationCanceledException)
+        {
+            // Expected when the user stops watching during a pending upload.
+        }
         catch (Exception ex)
         {
             var result = new UploadResult
@@ -211,5 +275,24 @@ public class FileWatcherService
             UploadCompleted?.Invoke(result);
             ErrorOccurred?.Invoke($"Failed to upload to {dest.Name}: {ex.Message}");
         }
+    }
+
+    private void CancelPendingChange()
+    {
+        lock (_changeLock)
+        {
+            _changeCts?.Cancel();
+            _changeCts?.Dispose();
+            _changeCts = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        Stop();
+        _disposed = true;
     }
 }
