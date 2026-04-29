@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Windows;
 using FreeFlow.Core.Models;
 using FreeFlow.Core.Services;
+using FreeFlow.Wpf.Services;
 using FreeFlow.Wpf.Utils;
 using Microsoft.Win32;
 
@@ -12,7 +13,7 @@ namespace FreeFlow.Wpf.ViewModels;
 
 public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
-    private readonly SettingsService _settingsService;
+    private readonly WindowsSettingsService _settingsService;
     private AppSettings _settings;
     private FileWatcherService? _watcher;
     private bool _isRunning;
@@ -22,7 +23,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public MainViewModel()
     {
-        _settingsService = new SettingsService();
+        _settingsService = new WindowsSettingsService();
         _settings = _settingsService.Load();
 
         Destinations = new ObservableCollection<FtpDestination>(_settings.Destinations);

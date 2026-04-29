@@ -40,7 +40,7 @@ The `FreeFlow.Core` library can be fully developed and tested on macOS.
 - v0.3: Installer + auto-start
 
 ## MVP Security Note
-Passwords are currently saved in the local `settings.json` file as plain text. This keeps the MVP simple, but the Windows UI should move to DPAPI (`ProtectedData`) before broad production use.
+The Windows UI protects saved passwords with DPAPI for the current Windows user. Existing plain-text passwords from early MVP builds are migrated the next time settings are saved.
 
 ## Contributing
 Pull requests welcome! Please open an issue first for major changes.
