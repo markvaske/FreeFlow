@@ -7,6 +7,8 @@ namespace FreeFlow.Core.Services;
 
 public sealed class FileWatcherService : IDisposable
 {
+    private const int MaxUploadAttempts = 3;
+
     private readonly AppSettings _settings;
     private readonly object _changeLock = new();
     private readonly SemaphoreSlim _uploadLock = new(1, 1);
@@ -234,47 +236,77 @@ public sealed class FileWatcherService : IDisposable
         FileInfo fileInfo,
         CancellationToken token)
     {
-        try
+        Exception? lastException = null;
+
+        for (var attempt = 1; attempt <= MaxUploadAttempts; attempt++)
         {
-            using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);
-
-            if (dest.Protocol == FtpProtocol.Ftps)
-                client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
-
-            token.ThrowIfCancellationRequested();
-            await client.Connect();
-
-            var remoteFile = FtpPath.Combine(dest.RemotePath, fileInfo.Name);
-            token.ThrowIfCancellationRequested();
-            await client.UploadFile(filePath, remoteFile, FtpRemoteExists.Overwrite, true);
-
-            var result = new UploadResult
+            try
             {
-                FileName = fileInfo.Name,
-                FileSize = fileInfo.Length,
-                Success = true,
-                DestinationName = dest.Name
-            };
+                using var client = new AsyncFtpClient(dest.Host, dest.Username, dest.Password, dest.Port);
 
-            UploadCompleted?.Invoke(result);
-            Log.Information("Uploaded to {Destination}", dest.Name);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when the user stops watching during a pending upload.
-        }
-        catch (Exception ex)
-        {
-            var result = new UploadResult
+                FtpClientOptions.Configure(client, dest.Protocol);
+
+                token.ThrowIfCancellationRequested();
+                await client.Connect();
+
+                var remoteFile = FtpPath.Combine(dest.RemotePath, fileInfo.Name);
+                token.ThrowIfCancellationRequested();
+                await client.UploadFile(filePath, remoteFile, FtpRemoteExists.Overwrite, true);
+
+                var result = new UploadResult
+                {
+                    FileName = fileInfo.Name,
+                    FileSize = fileInfo.Length,
+                    Success = true,
+                    DestinationName = dest.Name
+                };
+
+                UploadCompleted?.Invoke(result);
+                Log.Information(
+                    "Uploaded to {Destination} on attempt {Attempt}",
+                    dest.Name,
+                    attempt);
+                return;
+            }
+            catch (OperationCanceledException)
             {
-                FileName = fileInfo.Name,
-                Success = false,
-                ErrorMessage = ex.Message,
-                DestinationName = dest.Name
-            };
-            UploadCompleted?.Invoke(result);
-            ErrorOccurred?.Invoke($"Failed to upload to {dest.Name}: {ex.Message}");
+                // Expected when the user stops watching during a pending upload.
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                if (attempt == MaxUploadAttempts)
+                    break;
+
+                StatusChanged?.Invoke($"Upload to {dest.Name} failed; retrying ({attempt + 1}/{MaxUploadAttempts})...");
+                Log.Warning(
+                    ex,
+                    "Upload to {Destination} failed on attempt {Attempt}; retrying",
+                    dest.Name,
+                    attempt);
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(attempt * 2), token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
         }
+
+        var message = lastException?.Message ?? "Unknown upload error.";
+        var result = new UploadResult
+        {
+            FileName = fileInfo.Name,
+            Success = false,
+            ErrorMessage = message,
+            DestinationName = dest.Name
+        };
+        UploadCompleted?.Invoke(result);
+        ErrorOccurred?.Invoke($"Failed to upload to {dest.Name}: {message}");
     }
 
     private void CancelPendingChange()

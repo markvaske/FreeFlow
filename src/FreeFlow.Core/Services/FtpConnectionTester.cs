@@ -41,7 +41,7 @@ public static class FtpConnectionTester
                 destination.Password,
                 destination.Port);
 
-            ConfigureClient(client, destination.Protocol);
+            FtpClientOptions.Configure(client, destination.Protocol);
 
             statusChanged?.Invoke("Connecting...");
             cancellationToken.ThrowIfCancellationRequested();
@@ -98,17 +98,4 @@ public static class FtpConnectionTester
         }
     }
 
-    private static void ConfigureClient(AsyncFtpClient client, FtpProtocol protocol)
-    {
-        if (protocol == FtpProtocol.Ftps)
-        {
-            client.Config.EncryptionMode = FtpEncryptionMode.Explicit;
-            client.Config.DataConnectionEncryption = true;
-        }
-
-        client.Config.ConnectTimeout = 5000;
-        client.Config.ReadTimeout = 10000;
-        client.Config.DataConnectionConnectTimeout = 5000;
-        client.Config.DataConnectionReadTimeout = 10000;
-    }
 }
